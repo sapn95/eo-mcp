@@ -45,7 +45,13 @@ const freshState = () => ({
     { id: 1000, uid: 'CHE000000001', description: 'AK 1 - Example_Kasse Nord', sedexId: '6-001000-1', version: 0 },
     { id: 2000, uid: 'CHE000000002', description: 'AK 2 - Example_Kasse Süd', sedexId: '6-002000-1', version: 0 },
   ],
+  // Confirmation codes. A good one registers the account; any other is
+  // refused with a problem document whose type ends in the reason, which is
+  // where the portal's own client reads it from.
   tokens: { '11111111-1111-4111-8111-111111111111': 'SUCCESS_TOKEN', '22222222-2222-4222-8222-222222222222': 'USED_TOKEN' },
+  // false: logged in, but the portal has no claimant for the account yet.
+  registered: true,
+  onboardingAnswers: null,        // e.g. 500: the registration itself breaks
   // How the backend answers a browser nobody is logged in with.
   loggedOut: 'redirect',          // 'redirect' | '401' | 'html'
   // The login page logs itself in after this many ms; null = nobody ever does.
@@ -108,6 +114,7 @@ export async function startPortal(overrides = {}) {
       const p = path.slice('/napg/api/6'.length);
       let m;
       if (p === '/cases' && req.method === 'GET') {
+        if (!state.registered) return send(res, 403, '');
         return state.breakCases ? problem(res, 500, 'boom') : send(res, 200, state.cases);
       }
       if ((m = /^\/service-periods\/([^/]+)\/([^/]+)$/.exec(p)) && req.method === 'GET') {
@@ -175,8 +182,14 @@ export async function startPortal(overrides = {}) {
         return state.officesAnswer ? problem(res, state.officesAnswer, 'boom') : send(res, 200, state.offices);
       }
       if (p === '/astreints/onboarding' && req.method === 'POST') {
-        const result = state.tokens[body?.token];
-        return result ? send(res, 200, { status: result }) : problem(res, 400, 'UNKNOWN_TOKEN');
+        if (state.onboardingAnswers) return problem(res, state.onboardingAnswers, 'boom');
+        const result = state.tokens[body?.token] || 'UNKNOWN_TOKEN';
+        if (result !== 'SUCCESS_TOKEN') {
+          res.writeHead(400, { 'content-type': 'application/problem+json' });
+          return res.end(JSON.stringify({ status: 400, title: 'Bad Request', type: `https://fixture.invalid/problems/${result}` }));
+        }
+        state.registered = true;
+        return send(res, 200);
       }
       return send(res, 404, '');
     });

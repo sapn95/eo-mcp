@@ -15,7 +15,9 @@ before(async () => {
   portal = await startPortal();
   srv = await startServer({ EO_BASE_URL: portal.url, EO_STATE: portal.sessionFile(dir) });
 });
-after(async () => { await srv.stop(); await portal.close(); });
+// Each on its own: a server that never started, or one that will not stop,
+// must not leave the portal's listener open.
+after(async () => { try { await srv?.stop(); } finally { await portal?.close(); } });
 beforeEach(() => portal.reset());
 
 const call = async (name, args) => (await srv.call(name, args));
@@ -56,11 +58,22 @@ describe('reading', () => {
     assert.equal(periods[0].period_error.portal.detail, 'boom');
   });
 
-  test('an account without periods is pointed at the registration', async () => {
+  test('an account without periods says so', async () => {
     portal.state.cases = [];
     const r = await data('eo_list_periods');
     assert.deepEqual(r.periods, []);
-    assert.match(r.hint, /eo_register/);
+    assert.match(r.hint, /keine Perioden/);
+  });
+
+  test('an account the portal has no claimant for is not_registered, from every tool', async () => {
+    portal.state.registered = false;
+    assert.equal((await data('eo_status')).status, 'not_registered');
+    for (const [name, args] of [['eo_list_periods', {}], ['eo_get_form', { business_id: ID }], ['eo_submit', { business_id: ID, confirm: true }]]) {
+      const r = await call(name, args);
+      assert.equal(r.data.status, 'not_registered', name);
+      assert.match(r.data.message, /eo_register/, name);
+      assert.ok(!r.isError, name);
+    }
   });
 
   test('a case list the portal fails to serve is an error, not an empty list', async () => {
@@ -266,6 +279,10 @@ describe('attachments', () => {
 
   test('an attachment is deleted by id, and only one the period has', async () => {
     portal.state.attachments[ID] = [{ id: 4, categoryId: 'DIVERS_001', fileName: 'Example_A.pdf' }, { id: 5, categoryId: 'DIVERS_001', fileName: 'Example_B.pdf' }];
+    portal.state.attachments[OTHER_ID] = [{ id: 8, categoryId: 'DIVERS_001', fileName: 'Example_C.pdf' }];
+    const submitted = await data('eo_delete_attachment', { business_id: OTHER_ID, attachment_id: '8' });
+    assert.equal(submitted.deleted, false);
+    assert.equal(submitted.status, 'ASSIGNED');
     const wrong = await data('eo_delete_attachment', { business_id: ID, attachment_id: '9' });
     assert.equal(wrong.deleted, false);
     assert.equal(portal.calls('DELETE', /./).length, 0);
@@ -289,19 +306,28 @@ describe('attachments', () => {
 });
 
 describe('registration', () => {
-  test('a code the portal accepts is passed on with its answer and the periods', async () => {
+  test('a code the portal accepts registers the account, and the periods show it', async () => {
+    portal.state.registered = false;
+    assert.equal((await data('eo_status')).status, 'not_registered');
     const r = await data('eo_register', { code: ' 11111111-1111-4111-8111-111111111111 ' });
     assert.equal(r.registered, true);
-    assert.deepEqual(r.portal, { status: 'SUCCESS_TOKEN' });
     assert.equal(r.periods.length, 2);
+    assert.equal((await data('eo_status')).status, 'ok');
     assert.deepEqual(portal.calls('POST', /onboarding/)[0].body, { token: '11111111-1111-4111-8111-111111111111', language: 'de' });
   });
 
-  test('a code the portal refuses is not a registration', async () => {
-    const r = await data('eo_register', { code: '33333333-3333-4333-8333-333333333333' });
-    assert.equal(r.registered, false);
-    assert.equal(r.http, 400);
-    assert.equal(r.portal.detail, 'UNKNOWN_TOKEN');
+  test('a code the portal refuses is not a registration, and its reason is named', async () => {
+    for (const [code, reason] of [['33333333-3333-4333-8333-333333333333', 'UNKNOWN_TOKEN'], ['22222222-2222-4222-8222-222222222222', 'USED_TOKEN']]) {
+      const r = await data('eo_register', { code });
+      assert.equal(r.registered, false);
+      assert.equal(r.reason, reason);
+      assert.equal(r.http, 400);
+    }
+    portal.state.onboardingAnswers = 500;
+    const broken = await data('eo_register', { code: '11111111-1111-4111-8111-111111111111' });
+    assert.equal(broken.registered, false);
+    assert.equal(broken.reason, undefined);
+    assert.equal(broken.http, 500);
   });
 });
 

@@ -103,6 +103,16 @@ describe('login', () => {
     assert.match(data.message, /konnte nicht gespeichert werden/);
   });
 
+  test('a login to an account that is not registered yet went through, and says what comes next', async () => {
+    const portal = await portalWith({ autoLoginAfterMs: 200, registered: false });
+    const srv = await serverWith({ EO_BASE_URL: portal.url, EO_LOGIN_POLL_MS: '150', EO_LOGIN_TIMEOUT_MS: '20000' });
+    const { data } = await srv.call('eo_login');
+    assert.equal(data.status, 'not_registered');
+    assert.equal(data.session_cache, 'saved');
+    assert.match(data.next, /eo_register/);
+    assert.ok(existsSync(join(srv.scratch, 'state.json')));
+  });
+
   test('a state file that is not JSON just means logged out', async () => {
     const portal = await portalWith();
     const dir = mkdtempSync(join(tmpdir(), 'eo-state-'));
@@ -129,6 +139,20 @@ describe('shutdown', () => {
     await new Promise(r => { setTimeout(r, 1500); });
     const left = spawnSync('pgrep', ['-f', join(srv.scratch, 'profile')], { encoding: 'utf8' });
     assert.equal(left.stdout.trim(), '', 'a browser is still running on the profile');
+  });
+});
+
+describe('a browser that goes away', () => {
+  test('is replaced on the next call instead of being used again', async () => {
+    const portal = await portalWith();
+    const dir = mkdtempSync(join(tmpdir(), 'eo-gone-'));
+    const srv = await serverWith({ EO_BASE_URL: portal.url, EO_STATE: portal.sessionFile(dir) });
+    assert.deepEqual((await srv.call('eo_status')).data, { status: 'ok' });
+    // What closing the window amounts to: the browser on that profile is gone.
+    spawnSync('pkill', ['-f', join(srv.scratch, 'profile')]);
+    await new Promise(r => { setTimeout(r, 1500); });
+    assert.deepEqual((await srv.call('eo_status')).data, { status: 'ok' });
+    assert.equal((await srv.call('eo_list_periods')).data.periods.length, 2);
   });
 });
 
