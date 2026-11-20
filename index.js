@@ -160,6 +160,8 @@ async function browser(wantHeaded = false) {
     ctx = b.contexts()[0];
     if (!ctx) throw new Error(`EO_CDP_URL=${CDP_URL}: the browser there has no context to attach to`);
     attached = true;
+    forgetWhenClosed(ctx);
+    b.on('disconnected', () => { ctx = null; });
     return ctx;
   }
   if (ctx && (headed || !wantHeaded)) return ctx;
@@ -186,8 +188,16 @@ async function browser(wantHeaded = false) {
     ctx = await launch();
   }
   headed = wantHeaded;
+  forgetWhenClosed(ctx);
   await seedFromState(ctx);
   return ctx;
+}
+
+// A browser can go away underneath us: the login window is a window, and
+// people close windows. A context that has closed must not be handed out
+// again, or every later call fails on it until the server is restarted.
+function forgetWhenClosed(c) {
+  c.on('close', () => { if (ctx === c) { ctx = null; headed = false; } });
 }
 
 // ---- the portal's backend ----
@@ -195,6 +205,9 @@ async function browser(wantHeaded = false) {
 // Thrown by `api` when the portal answers as it does to a browser nobody is
 // logged in with, and turned into status "login_required" in one place below.
 class LoginRequired extends Error {}
+// Thrown where the portal knows the login but has no claimant behind it yet:
+// its web client shows the confirmation-code page on exactly this answer.
+class NotRegistered extends Error {}
 
 // One request to the backend, sent with the browser's cookies. Redirects are
 // not followed: an expired session is answered with a redirect to AGOV, and
@@ -212,7 +225,10 @@ async function api(method, path, { json, multipart, params } = {}) {
   });
   const status = r.status();
   const type = r.headers()['content-type'] || '';
-  const body = await r.text().catch(() => '');
+  let body;
+  // The body of a response stays in the browser context's memory until it is
+  // disposed of, and this server keeps one context for as long as it runs.
+  try { body = await r.text().catch(() => ''); } finally { await r.dispose().catch(() => {}); }
   // 401 is what the backend says to its own client; a redirect or a page of
   // HTML where JSON was asked for is what the gateway in front of it says.
   if (status === 401 || (status >= 300 && status < 400) || (status === 200 && body && /text\/html/i.test(type))) {
@@ -243,6 +259,7 @@ function businessId(args) {
 
 async function cases() {
   const r = await api('GET', '/cases');
+  if (r.status === 403) throw new NotRegistered();
   if (!r.ok || !Array.isArray(r.data)) throw new Error(`Die Fallübersicht liess sich nicht lesen (HTTP ${r.status})`);
   return r.data;
 }
@@ -409,16 +426,16 @@ function checkUpload(file) {
 
 // ---- tool definitions ----
 const TOOLS = [
-  { name: 'eo_status', description: 'Check whether the EO portal session is alive (ok) or an interactive AGOV login is needed (login_required). Call this before anything else; it also refreshes the cached session.', inputSchema: { type: 'object', properties: {} } },
-  { name: 'eo_login', description: 'Open a visible browser window for the AGOV login and wait until the portal itself answers as logged in (up to 8 min). Only status "ok" means the login went through; a login nobody finished comes back as login_required and nothing is cached.', inputSchema: { type: 'object', properties: {} } },
-  { name: 'eo_register', description: 'First-time registration: link the logged-in AGOV account to the claimant with the confirmation code (Bestätigungscode, a UUID) from the mail or SMS "Registrierung auf dem EO-Portal". The portal answers with a result such as SUCCESS_TOKEN, USED_TOKEN, EXPIRED_TOKEN or UNKNOWN_TOKEN, which is passed on as it came. Not needed again once the periods are listed.', inputSchema: { type: 'object', properties: { code: { type: 'string', description: 'the confirmation code, e.g. 00000000-0000-0000-0000-000000000000' } }, required: ['code'] } },
-  { name: 'eo_list_periods', description: 'The service periods of the logged-in person, each with its business_id (Fall-ID), case status (EDITING = draft to complete, ASSIGNED = submitted to the compensation office, …) and the period as the service organisation reported it: service type, dates, number of days, address, IBAN. An empty list is what an account without a registration looks like — see eo_register.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'eo_status', description: 'Check the EO portal session: ok, login_required (an interactive AGOV login is needed) or not_registered (logged in, but the account still needs eo_register). Call this before anything else; it also refreshes the cached session.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'eo_login', description: 'Open a visible browser window for the AGOV login and wait until the portal itself answers as logged in (up to 8 min). Status ok or not_registered means the login went through (not_registered: continue with eo_register); a login nobody finished comes back as login_required and nothing is cached.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'eo_register', description: 'First-time registration: link the logged-in AGOV account to the claimant with the confirmation code (Bestätigungscode, a UUID) from the mail or SMS "Registrierung auf dem EO-Portal". registered:true comes with the periods the account now lists. A code the portal refuses comes back with its reason: USED_TOKEN, EXPIRED_TOKEN, UNKNOWN_TOKEN, CANCELED_TOKEN or EPORTAL_ID_ALREADY_ASSOCIATED. Not needed again once the periods are listed.', inputSchema: { type: 'object', properties: { code: { type: 'string', description: 'the confirmation code, e.g. 00000000-0000-0000-0000-000000000000' } }, required: ['code'] } },
+  { name: 'eo_list_periods', description: 'The service periods of the logged-in person, each with its business_id (Fall-ID), case status (EDITING = draft to complete, ASSIGNED = submitted to the compensation office, …) and the period as the service organisation reported it: service type, dates, number of days, address, IBAN. An account that is not registered yet comes back as status not_registered — see eo_register.', inputSchema: { type: 'object', properties: {} } },
   { name: 'eo_get_form', description: 'The claim form of one period as the portal stores it: activity (hasIncome, activityType, activityDetails with the employer), familySituation, bankAccountDetails, contactDetails, isServicePeriodValidated — plus the uploaded attachments and the required attachment categories that are still missing. form is null where the period has never been opened in the portal.', inputSchema: { type: 'object', properties: { business_id: { type: 'string' } }, required: ['business_id'] } },
   { name: 'eo_update_form', description: 'Change the DRAFT of a claim form. changes is laid over the stored form: objects are merged key by key, any other value (including an array and null) replaces what was there — so {"familySituation":{"hasChildren":false}} touches that one answer. Read the form with eo_get_form first and keep to its field names. An employee, as the portal stores one: activity = {hasIncome:true, employerInSwitzerland:true, activityType:"EMPLOYEE", activityDetails:{_type:"ActivityEmployee", employer:{uid, organisationName, town, npa, address, cantonAbbreviation, compensationOffice:{uid, notFound:false, accountNumber:null}, notFound:false, byUid:true, farmingAllowance:false}, otherEmployer:[]}}, with the employer taken from eo_search_employers. activityType is one of EMPLOYEE, APPRENTICE, STUDENT, FREELANCE, FREELANCE_AND_EMPLOYEE, NOT_GAINFULLY_EMPLOYED, UNEMPLOYED_WITH_INTERMEDIATE_PROFIT, UNEMPLOYED_WITHOUT_INTERMEDIATE_PROFIT, INTERNATIONAL_EMPLOYEES, ANOBAG. Only a case in status EDITING is changed, the write carries the version that was read (a change made elsewhere in between is refused, not overwritten), and the stored form is read back and compared with what was asked for. Nothing is submitted by this.', inputSchema: { type: 'object', properties: { business_id: { type: 'string' }, changes: { type: 'object', description: 'partial form, merged into the stored one' } }, required: ['business_id', 'changes'] } },
   { name: 'eo_search_employers', description: 'Look an employer up in the register the portal uses, by name (optionally narrowed by zip, town, canton) or by uid (CHE-123.456.789, any punctuation). Each hit carries uid, organisationName, address, npa, town, cantonAbbreviation and the uid of its compensation office.', inputSchema: { type: 'object', properties: { name: { type: 'string' }, zip: { type: 'string' }, town: { type: 'string' }, canton: { type: 'string', description: 'two letters, e.g. BE' }, uid: { type: 'string' } } } },
   { name: 'eo_compensation_offices', description: 'The compensation offices (Ausgleichskassen) the portal knows, each with id, uid and description. query filters by a substring of the description or by uid.', inputSchema: { type: 'object', properties: { query: { type: 'string' } } } },
   { name: 'eo_upload_attachment', description: 'Attach a file to the draft of one period. file = absolute path, at most 5 MB. category is one of FEUCOMP_001…004, ATTFORMENF_001/002, FICHEETRAN_001, CHOMAGE_001, FINFORMAST_001, ATTFORMAST_001 or DIVERS_001 (other documents); eo_get_form names the categories a claim still requires. Whether the file type is accepted is the portal\'s decision and its answer is passed on.', inputSchema: { type: 'object', properties: { business_id: { type: 'string' }, category: { type: 'string' }, file: { type: 'string' } }, required: ['business_id', 'category', 'file'] } },
-  { name: 'eo_delete_attachment', description: 'Remove one uploaded attachment from the draft of a period, by the id eo_get_form lists it under. An id the period does not have is refused before anything is sent.', inputSchema: { type: 'object', properties: { business_id: { type: 'string' }, attachment_id: { type: 'string' } }, required: ['business_id', 'attachment_id'] } },
+  { name: 'eo_delete_attachment', description: 'Remove one uploaded attachment from the draft of a period, by the id eo_get_form lists it under. Only a case in status EDITING is touched, and an id the period does not have is refused before anything is sent.', inputSchema: { type: 'object', properties: { business_id: { type: 'string' }, attachment_id: { type: 'string' } }, required: ['business_id', 'attachment_id'] } },
   { name: 'eo_submit', description: 'DANGER: confirm the claim and send it to the compensation office. Irreversible. Requires confirm:true; otherwise returns a dry run with the period, the form and the attachments exactly as they would be sent. Refused, confirm:true and all, where the case is not in status EDITING (already_submitted for a case that is past it), where the period has not been confirmed as correct, where no activity is chosen, or where a required attachment is missing. submitted:true is only reported once the portal lists the case in a status other than EDITING.', inputSchema: { type: 'object', properties: { business_id: { type: 'string' }, confirm: { type: 'boolean' } }, required: ['business_id'] } },
 ];
 
@@ -461,12 +478,14 @@ function takeTurn() {
 }
 
 const sleep = ms => new Promise(r => { setTimeout(r, ms); });
+const NOT_REGISTERED = 'Die AGOV-Anmeldung steht, aber das Portal kennt zu diesem Konto noch keine dienstleistende Person — bitte eo_register mit dem Bestätigungscode aus dem Mail oder SMS "Registrierung auf dem EO-Portal" aufrufen.';
 
 // Is anybody logged in? Asked of the backend, because that is the only thing
 // whose answer means it: an address bar on the portal's host proves nothing.
 async function sessionStatus() {
   try { await cases(); return 'ok'; } catch (e) {
     if (e instanceof LoginRequired) return 'login_required';
+    if (e instanceof NotRegistered) return 'not_registered';
     throw e;
   }
 }
@@ -478,8 +497,8 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
   try {
     if (name === 'eo_status') {
       const status = await sessionStatus();
-      if (status === 'ok') await saveState();
-      return text({ status });
+      if (status !== 'login_required') await saveState();
+      return text({ status, ...(status === 'not_registered' ? { message: NOT_REGISTERED } : {}) });
     }
     if (name === 'eo_login') {
       const c = await browser(true);
@@ -490,17 +509,18 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
       await p.bringToFront().catch(() => {});
       const deadline = Date.now() + LOGIN_TIMEOUT;
       let status = await sessionStatus();
-      while (status !== 'ok' && Date.now() < deadline) {
+      while (status === 'login_required' && Date.now() < deadline) {
         await sleep(LOGIN_POLL);
         status = await sessionStatus();
       }
-      if (status !== 'ok') {
+      if (status === 'login_required') {
         return text({ status, message: 'Die Anmeldung ist nicht abgeschlossen — das Portal weist niemanden als angemeldet aus. Bitte eo_login erneut aufrufen und die AGOV-Anmeldung im Fenster zu Ende führen; es wurde nichts zwischengespeichert.' });
       }
       const cached = await saveState();
       return text({
-        status: 'ok',
+        status,
         session_cache: cached,
+        ...(status === 'not_registered' ? { next: NOT_REGISTERED } : {}),
         message: {
           saved: 'AGOV-Anmeldung erfolgreich, Session in state.json gespeichert (überlebt Server-Neustarts).',
           disabled: 'AGOV-Anmeldung erfolgreich. EO_STATE ist leer — die Session wird NICHT zwischengespeichert und ist nach einem Neustart weg.',
@@ -517,18 +537,25 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
         return text({ registered: false, error: 'code ist kein Bestätigungscode — erwartet wird eine UUID wie 00000000-0000-0000-0000-000000000000; es wurde nichts gesendet' });
       }
       const r = await api('POST', '/astreints/onboarding', { json: { token: code, language: LANGUAGE } });
-      if (!r.ok) return text({ registered: false, ...refusal(r), error: 'Das Portal hat den Bestätigungscode nicht angenommen' });
+      if (!r.ok) {
+        // The reason is the last segment of the problem type, which is where
+        // the portal's own client reads it from: USED_TOKEN, EXPIRED_TOKEN,
+        // UNKNOWN_TOKEN, CANCELED_TOKEN or EPORTAL_ID_ALREADY_ASSOCIATED.
+        const reason = typeof r.data?.type === 'string' ? r.data.type.split('/').pop() : null;
+        return text({ registered: false, ...(reason ? { reason } : {}), ...refusal(r), error: 'Das Portal hat den Bestätigungscode nicht angenommen' });
+      }
       await saveState();
-      // What the portal answered is passed on rather than interpreted, and the
-      // periods are the evidence: a registration that worked lists some.
-      return text({ registered: true, portal: r.data ?? r.text, periods: await listPeriods() });
+      // Any success answer is a registration, as it is for the portal's own
+      // client. The periods are the evidence: an account that is registered
+      // lists them instead of being refused.
+      return text({ registered: true, periods: await listPeriods() });
     }
     if (name === 'eo_list_periods') {
       const periods = await listPeriods();
       await saveState();
       return text({
         periods,
-        ...(periods.length ? {} : { hint: 'Das Portal führt für dieses Konto keine Perioden. Ist das Konto noch nicht registriert, braucht es den Bestätigungscode aus dem Mail "Registrierung auf dem EO-Portal" (eo_register).' }),
+        ...(periods.length ? {} : { hint: 'Das Portal führt für dieses Konto keine Perioden.' }),
       });
     }
     if (name === 'eo_get_form') {
@@ -606,6 +633,10 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     if (name === 'eo_delete_attachment') {
       const id = businessId(args);
       const want = String(args.attachment_id ?? '');
+      const c = await caseFor(id);
+      if (c.status !== 'EDITING') {
+        return text({ deleted: false, status: c.status, error: `Die Periode ist im Status ${c.status} — Beilagen lassen sich nur aus einem Antrag im Status EDITING entfernen; es wurde nichts gelöscht` });
+      }
       const before = await attachments(id);
       const hit = before.find(a => String(a.id) === want);
       if (!hit) return text({ deleted: false, error: `Die Periode hat keine Beilage mit der id "${want}" — es wurde nichts gelöscht`, attachments: before });
@@ -670,6 +701,7 @@ server.setRequestHandler(CallToolRequestSchema, async req => {
     if (e instanceof LoginRequired) {
       return text({ status: 'login_required', message: 'Im EO-Portal ist niemand angemeldet — bitte zuerst eo_login.' });
     }
+    if (e instanceof NotRegistered) return text({ status: 'not_registered', message: NOT_REGISTERED });
     return { content: [{ type: 'text', text: 'ERROR: ' + (e.message || String(e)) }], isError: true };
   } finally {
     // Whatever happened, the next caller gets its turn.

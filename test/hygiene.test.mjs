@@ -17,6 +17,10 @@ const SCAN = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'hyg
 // core.quotepath, a signing key or a commit template would each change what the
 // scan sees, and the point of these tests is the default a fresh clone gets.
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+// Run from inside a git hook, the suite inherits the hook's repository and the
+// committer's identity. Either would point the fixture commands at the wrong
+// repository or override the address each fixture sets.
+for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL']) delete GIT_ENV[k];
 
 // Assembled at runtime, never written down. The scan matches the AWS key-id
 // shape wherever it finds it — including in this file, which is itself tracked

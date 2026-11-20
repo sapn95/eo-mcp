@@ -55,9 +55,10 @@ Checked on the live portal on 20 November 2026 (web client 13.4.3, backend
 - attaching to a running browser through `EO_CDP_URL`
 
 Checked only against the fixture portal in `test/`, which answers in the shapes
-recorded from the real one: `eo_login`, `eo_register`, a successful
-`eo_update_form`, the attachment tools and a confirmed `eo_submit`. The
-endpoints and request bodies come from the portal's web client. Until someone
+recorded from the real one: `eo_login`, `eo_register`, the `not_registered`
+status, a successful `eo_update_form`, the attachment tools and a confirmed
+`eo_submit`. The endpoints, the request bodies and the answers the fixture
+gives for these come from reading the portal's web client. Until someone
 has run them on a live draft, read the form back with `eo_get_form` after a
 change, and look at the dry run before you confirm.
 
@@ -71,13 +72,15 @@ the portal validates it.
 - **Node.js 20.19 or later**
 - A Chromium-based browser. An installed Chrome, Edge or Brave is preferred
   over Playwright's own Chromium, which cannot reach the platform
-  authenticator, so AGOV offers no passkey there.
+  authenticator, so AGOV offers no passkey there. Only the default macOS
+  install locations are searched. Anywhere else, set `EO_BROWSER` to the
+  absolute path of the browser, or install Playwright's Chromium.
 
 ```bash
 git clone https://github.com/sapn95/eo-mcp.git
 cd eo-mcp
 npm install
-npx playwright install chromium   # only if no Chrome, Edge or Brave is installed
+npx playwright install chromium   # only if no Chrome, Edge or Brave is found
 ```
 
 ## Register in Claude Code
@@ -99,9 +102,10 @@ Or in an MCP client configuration:
 ## First use
 
 1. `eo_login` opens a browser window. Log in with AGOV. The tool waits up to
-   eight minutes and returns `ok` once the portal itself answers as logged in.
-2. On a new account `eo_list_periods` is empty. Call `eo_register` with the
-   confirmation code from the mail or SMS «Registrierung auf dem EO-Portal».
+   eight minutes and returns once the portal itself answers as logged in.
+2. On a new account the status is `not_registered`. Call `eo_register` with
+   the confirmation code from the mail or SMS «Registrierung auf dem
+   EO-Portal».
 3. `eo_list_periods` now shows your periods with their `business_id`.
 4. Open the period once in the portal. The portal's web client creates the
    form on first opening, and this server does not create one.
@@ -117,13 +121,14 @@ back on the next start. Both are created for your user only (`0700` and
 `0600`), because a session cookie is as good as your login.
 
 An expired session comes back as `{"status": "login_required"}` from every
-tool. Call `eo_login` again.
+tool. Call `eo_login` again. An account the portal has no claimant for yet
+comes back as `{"status": "not_registered"}`.
 
 ## Environment
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `EO_PROFILE` | `~/.eo-mcp/profile` | Browser profile. Empty: a throwaway profile, nothing is kept. |
+| `EO_PROFILE` | `~/.eo-mcp/profile` | Browser profile. Empty: a throwaway profile. The session is still cached unless `EO_STATE` is empty too. |
 | `EO_STATE` | `~/.eo-mcp/state.json` | Session cache. Empty: the session is not cached. |
 | `EO_BROWSER` | first installed of Chrome, Chrome Canary, Edge, Brave | `chrome`, `chrome-canary`, `edge`, `brave`, `chromium` or an absolute path. |
 | `EO_CDP_URL` | unset | Attach to a browser that already runs with `--remote-debugging-port`, for example `http://127.0.0.1:9222`, and use its session. Nothing is cached, and the browser keeps running when the server stops. |
@@ -140,9 +145,9 @@ browser, so open it only for as long as you need it.
 
 | Tool | What it does |
 | --- | --- |
-| `eo_status` | `ok` or `login_required`. |
+| `eo_status` | `ok`, `login_required` or `not_registered`. |
 | `eo_login` | Opens the login window and waits until the portal answers as logged in. |
-| `eo_register` | Sends the confirmation code. Returns the portal's result (`SUCCESS_TOKEN`, `USED_TOKEN`, `EXPIRED_TOKEN`, `UNKNOWN_TOKEN`) and the periods. |
+| `eo_register` | Sends the confirmation code and returns the periods. A refused code comes back with the portal's reason, for example `USED_TOKEN`, `EXPIRED_TOKEN` or `UNKNOWN_TOKEN`. |
 
 ### Reading
 
@@ -163,7 +168,7 @@ claim is with the compensation office. The others are `INITIATED`,
 | --- | --- |
 | `eo_update_form` | Lays `changes` over the stored form and writes it back. |
 | `eo_upload_attachment` | Attaches a file of at most 5 MB under a category. |
-| `eo_delete_attachment` | Removes one attachment by id. |
+| `eo_delete_attachment` | Removes one attachment by id, from a draft only. |
 
 `eo_update_form` merges objects key by key. Any other value replaces what was
 there, including an array and `null`. The portal uses `null` for «not
@@ -234,8 +239,8 @@ the case is no longer in `EDITING` there.
 
 - `login_required` right after `eo_login`: the login was not finished in the
   window. Call `eo_login` again.
-- `eo_list_periods` is empty: the account is not registered yet. Use
-  `eo_register` with the confirmation code.
+- `not_registered`: the login worked, but the account has no claimant yet.
+  Use `eo_register` with the confirmation code.
 - `Für diese Periode gibt es noch kein Formular`: open the period once in the
   portal.
 - `EO_BROWSER="…" not found`: the path or name does not exist on this machine.
