@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, statSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { chromium } from 'playwright';
 import { startServer } from './client.mjs';
 import { startPortal, ID, COOKIE } from './fixture-portal.mjs';
@@ -136,16 +136,18 @@ describe('attached to a running browser', () => {
   test('EO_CDP_URL uses that browser\'s session, caches nothing and leaves it running', async () => {
     const portal = await portalWith();
     const port = 20000 + Math.floor(Math.random() * 20000);
-    const profile = mkdtempSync(join(tmpdir(), 'eo-cdp-'));
-    const theirs = spawn(someBrowser(), [
-      '--headless=new', `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, '--no-first-run', 'about:blank',
-    ], { stdio: 'ignore' });
-    cleanup.push(async () => { theirs.kill(); });
+    // Started through Playwright rather than by hand: it knows the flags a
+    // browser needs to come up at all on a CI runner, where the sandbox Chrome
+    // asks for is not available.
+    const theirs = await chromium.launch({ headless: true, executablePath: someBrowser(), args: [`--remote-debugging-port=${port}`] });
+    cleanup.push(() => theirs.close());
     const cdp = `http://127.0.0.1:${port}`;
-    for (let i = 0; i < 100; i++) {
-      if (await fetch(`${cdp}/json/version`).then(r => r.ok).catch(() => false)) break;
-      await new Promise(r => { setTimeout(r, 100); });
+    let up = false;
+    for (let i = 0; i < 100 && !up; i++) {
+      up = await fetch(`${cdp}/json/version`).then(r => r.ok).catch(() => false);
+      if (!up) await new Promise(r => { setTimeout(r, 100); });
     }
+    assert.ok(up, 'the browser to attach to never opened its debugging port');
     // "Their" login: the cookie is put into the running browser from outside.
     const owner = await chromium.connectOverCDP(cdp);
     await owner.contexts()[0].addCookies([{ name: COOKIE, value: 'ok', url: portal.url }]);
